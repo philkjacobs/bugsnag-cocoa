@@ -11,6 +11,112 @@
 #import <Foundation/Foundation.h>
 #import "BSG_KSDynamicLinker.h"
 #import "BSG_KSMachHeaders.h"
+#import "BugsnagPlatformConditional.h"
+
+// MARK: - Locking
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability"
+static os_unfair_lock bsg_mach_binary_images_access_lock_unfair = OS_UNFAIR_LOCK_INIT;
+_Pragma("clang diagnostic pop")
+
+_Pragma("clang diagnostic push")
+_Pragma("clang diagnostic ignored \"-Wdeprecated-declarations\"")
+static OSSpinLock bsg_mach_binary_images_access_lock_spin = OS_SPINLOCK_INIT;
+_Pragma("clang diagnostic pop")
+
+// Lock helpers.  These use bulky Pragmas to hide warnings so are in their own functions for clarity, below.
+
+void bsg_spin_lock() {
+    _Pragma("clang diagnostic push")
+    _Pragma("clang diagnostic ignored \"-Wdeprecated-declarations\"")
+    OSSpinLockLock(&bsg_mach_binary_images_access_lock_spin);
+    _Pragma("clang diagnostic pop")
+}
+
+void bsg_spin_unlock() {
+    _Pragma("clang diagnostic push")
+    _Pragma("clang diagnostic ignored \"-Wdeprecated-declarations\"")
+    OSSpinLockUnlock(&bsg_mach_binary_images_access_lock_spin);
+    _Pragma("clang diagnostic pop")
+}
+
+void bsg_unfair_lock() {
+    _Pragma("clang diagnostic push")
+    _Pragma("clang diagnostic ignored \"-Wunguarded-availability\"")
+    os_unfair_lock_lock(&bsg_mach_binary_images_access_lock_unfair);
+    _Pragma("clang diagnostic pop")
+}
+
+void bsg_unfair_unlock() {
+    _Pragma("clang diagnostic push")
+    _Pragma("clang diagnostic ignored \"-Wunguarded-availability\"")
+    os_unfair_lock_unlock(&bsg_mach_binary_images_access_lock_unfair);
+    _Pragma("clang diagnostic pop")
+}
+
+// Lock and unlock sections of code
+
+void bsg_dyld_cache_lock() {
+    NSOperatingSystemVersion version = [[NSProcessInfo processInfo] operatingSystemVersion];
+    
+#if BSG_PLATFORM_IOS
+    if (version.majorVersion < 10) {
+        bsg_spin_lock();
+        return;
+    }
+    bsg_unfair_lock();
+#elif BSG_PLATFORM_OSX
+    if (version.majorVersion < 10 && version.minorVersion < 12) {
+        bsg_spin_lock();
+        return;
+    }
+    bsg_unfair_lock();
+#elif BSG_PLATFORM_TVOS
+    if (version.majorVersion < 10) {
+        bsg_spin_lock();
+        return;
+    }
+    bsg_unfair_lock();
+#elif BSG_PLATFORM_WATCHOS
+    if (version.majorVersion < 3) {
+        bsg_spin_lock();
+        return;
+    }
+    bsg_unfair_lock();
+#endif
+}
+
+void bsg_dyld_cache_unlock() {
+    NSOperatingSystemVersion version = [[NSProcessInfo processInfo] operatingSystemVersion];
+    
+#if BSG_PLATFORM_IOS
+    if (version.majorVersion < 10) {
+        bsg_spin_unlock();
+        return;
+    }
+    bsg_unfair_unlock();
+#elif BSG_PLATFORM_OSX
+    if (version.majorVersion < 10 && version.minorVersion < 12) {
+        bsg_spin_unlock();
+        return;
+    }
+    bsg_unfair_unlock();
+#elif BSG_PLATFORM_TVOS
+    if (version.majorVersion < 10) {
+        bsg_spin_unlock();
+        return;
+    }
+    bsg_unfair_unlock();
+#elif BSG_PLATFORM_WATCHOS
+    if (version.majorVersion < 3) {
+        bsg_spin_unlock();
+        return;
+    }
+    bsg_unfair_unlock();
+#endif
+}
+
 
 // MARK: - Replicate the DYLD API
 
@@ -53,7 +159,7 @@ BSG_Mach_Binary_Image_Info *bsg_dyld_get_image_info(uint32_t imageIndex) {
  */
 void bsg_add_mach_binary_image(BSG_Mach_Binary_Image_Info element) {
     
-    BSG_DYLD_CACHE_LOCK
+    bsg_dyld_cache_lock();
     
     // Expand array if necessary.  We're slightly paranoid here.  An OOM is likely to be indicative of bigger problems
     // but we should still do *our* best not to crash the app.
@@ -69,7 +175,7 @@ void bsg_add_mach_binary_image(BSG_Mach_Binary_Image_Info element) {
         }
         else {
             // Exit early, don't expand the array, don't store the header info and unlock
-            BSG_DYLD_CACHE_UNLOCK
+            bsg_dyld_cache_unlock();
             return;
         }
     }
@@ -77,7 +183,7 @@ void bsg_add_mach_binary_image(BSG_Mach_Binary_Image_Info element) {
     // Store the value, increment the number of used elements
     bsg_mach_binary_images.contents[bsg_mach_binary_images.used++] = element;
     
-    BSG_DYLD_CACHE_UNLOCK
+    bsg_dyld_cache_unlock();
 }
 
 /**
@@ -87,7 +193,7 @@ void bsg_add_mach_binary_image(BSG_Mach_Binary_Image_Info element) {
  */
 void bsg_remove_mach_binary_image(uint64_t imageVmAddr) {
     
-    BSG_DYLD_CACHE_LOCK
+    bsg_dyld_cache_lock();
     
     for (uint32_t i=0; i<bsg_mach_binary_images.used; i++) {
         BSG_Mach_Binary_Image_Info item = bsg_mach_binary_images.contents[i];
@@ -104,7 +210,7 @@ void bsg_remove_mach_binary_image(uint64_t imageVmAddr) {
         }
     }
     
-    BSG_DYLD_CACHE_UNLOCK
+    bsg_dyld_cache_unlock();
 }
 
 BSG_Mach_Binary_Images *bsg_initialise_mach_binary_headers(uint32_t initialSize) {
