@@ -80,11 +80,29 @@ Then("The app is not running") do
   end
 end
 
-Then("each event in the payload matches one of:") do |table|
+Then("the payload field matches one of:") do |table|
   # Checks string equality of event fields against values
-  events = read_key_path(Server.current_request[:body], "events")
+  request = Server.current_request[:body]
+  assert_not_nil(request, "expected request but received nothing")
+
+  events = read_key_path(request, "events")
+  assert_not_nil(events, "expected event array but received nothing")
+
   table.hashes.each do |values|
     assert_not_nil(events.detect do |event|
+      values.all? do |key, value|
+        payload_field = read_key_path(event, key)
+        value == payload_field || (value.to_i == payload_field.to_i)
+      end
+    end, "No event matches the following values: #{values}")
+  end
+end
+
+Then("the request {int} matches one of:") do |request_index, table|
+  # Checks string equality of event fields against values
+  events = read_key_path(find_request(request_index)[:body], "events")
+  table.hashes.each do |values|
+    events.detect do |event|
       values.all? do |k, v|
         if k.start_with? 'has '
           event_value = read_key_path(event, k.split(' ').last)
@@ -94,9 +112,23 @@ Then("each event in the payload matches one of:") do |table|
             event_value.nil?
           end
         else
-          v == read_key_path(event, k) || (v.to_i == read_key_path(event, k).to_i)
+          v == read_key_path(event, k) || (v.to_i > 0 && v.to_i == read_key_path(event, k).to_i)
         end
       end
+    end
+  end
+end
+
+Then("each event with a session in the payload for request {int} matches one of:") do |request_index, table|
+  events = read_key_path(find_request(request_index)[:body], "events")
+  table.hashes.each do |values|
+    assert_not_nil(events.detect do |event|
+      handled_count = read_key_path(event, "session.events.handled")
+      unhandled_count = read_key_path(event, "session.events.unhandled")
+      error_class = read_key_path(event, "exceptions.0.errorClass")
+      handled_count == values["handled"].to_i &&
+        unhandled_count == values["unhandled"].to_i &&
+        error_class == values["class"]
     end, "No event matches the following values: #{values}")
   end
 end

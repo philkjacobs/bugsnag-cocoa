@@ -24,7 +24,7 @@
 // THE SOFTWARE.
 //
 
-#import "BugsnagSink.h"
+#import "BugsnagErrorReportSink.h"
 #import "Bugsnag.h"
 #import "BugsnagLogger.h"
 #import "BugsnagCollections.h"
@@ -65,7 +65,7 @@
 @property(readonly, retain, nullable) NSURL *notifyURL;
 @end
 
-@implementation BugsnagSink
+@implementation BugsnagErrorReportSink
 
 - (instancetype)initWithApiClient:(BugsnagErrorReportApiClient *)apiClient {
     if (self = [super init]) {
@@ -74,82 +74,72 @@
     return self;
 }
 
-// Entry point called by BSG_KSCrash when a report needs to be sent. Handles
-// report filtering based on the configuration options for
-// `enabledReleaseStages`. Removes all reports not meeting at least one of the
-// following conditions:
-// - the report-specific config specifies the `enabledReleaseStages` property and
-// it contains the current stage
-// - the report-specific and global `enabledReleaseStages` properties are unset
-// - the report-specific `enabledReleaseStages` property is unset and the global
-// `enabledReleaseStages` property
-//   and it contains the current stage
-- (void)filterReports:(NSDictionary <NSString *, NSDictionary *> *)reports
-         onCompletion:(BSG_KSCrashReportFilterCompletion)onCompletion {
-    NSMutableArray *bugsnagReports = [NSMutableArray new];
+// TODO need to investigate whether dupe events are handled?
+- (void)sendStoredReports:(NSDictionary <NSString *, NSDictionary *> *)ksCrashReports
+                withBlock:(BSGOnErrorSentBlock)block {
+
+    NSMutableDictionary<NSString *, BugsnagEvent *>* storedEvents = [NSMutableDictionary new];
     BugsnagConfiguration *configuration = [Bugsnag configuration];
-    
-    for (NSString *fileKey in reports) {
-        NSDictionary *report = reports[fileKey];
-        BugsnagEvent *bugsnagReport = [[BugsnagEvent alloc] initWithKSReport:report];
-        bugsnagReport.codeBundleId = [Bugsnag client].codeBundleId;
 
-        if (![bugsnagReport shouldBeSent])
-            continue;
-        BOOL shouldSend = YES;
-        for (BugsnagOnSendErrorBlock block in configuration.onSendBlocks) {
-            @try {
-                shouldSend = block(bugsnagReport);
-                if (!shouldSend)
-                    break;
-            } @catch (NSException *exception) {
-                bsg_log_err(@"Error from onSend callback: %@", exception);
-            }
-        }
-        if (shouldSend) {
-            [bugsnagReports addObject:bugsnagReport];
+    for (NSString *fileKey in ksCrashReports) {
+        NSDictionary *report = ksCrashReports[fileKey];
+        BugsnagEvent *event = [[BugsnagEvent alloc] initWithKSReport:report];
+        event.codeBundleId = [Bugsnag client].codeBundleId;
+
+        if ([event shouldBeSent] && [self runOnSendBlocks:configuration event:event]) {
+            storedEvents[fileKey] = event;
+        } else { // delete the report as the user has discarded it
+            block(fileKey, true, nil);
         }
     }
-
-    if (bugsnagReports.count == 0) {
-        if (onCompletion) {
-            onCompletion(bugsnagReports.count, YES, nil);
-        }
-        return;
-    }
-
-    NSDictionary *reportData = [self getBodyFromEvents:bugsnagReports];
-
-    if (reportData == nil) {
-        if (onCompletion) {
-            onCompletion(0, YES, nil);
-        }
-        return;
-    }
-
-    [self.apiClient sendItems:bugsnagReports.count
-                  withPayload:reportData
-                        toURL:configuration.notifyURL
-                      headers:[configuration errorApiHeaders]
-                 onCompletion:onCompletion];
+    [self deliverStoredEvents:storedEvents configuration:configuration block:block];
 }
 
-// Generates the payload for notifying Bugsnag
-- (NSDictionary *)getBodyFromEvents:(NSArray *)events {
+- (void)deliverStoredEvents:(NSMutableDictionary<NSString *, BugsnagEvent *> *)storedEvents
+              configuration:(BugsnagConfiguration *)configuration
+                      block:(BSGOnErrorSentBlock)block {
+    for (NSString *filename in storedEvents) {
+        BugsnagEvent *event = storedEvents[filename];
+        event.redactedKeys = configuration.redactedKeys;
+        NSDictionary *requestPayload = [self prepareEventPayload:event];
+
+        [self.apiClient sendItems:1
+                      withPayload:requestPayload
+                            toURL:configuration.notifyURL
+                          headers:[configuration errorApiHeaders]
+                     onCompletion:^(NSUInteger reportCount, BOOL success, NSError *error) {
+                         if (block) {
+                             block(filename, success, error);
+                         }
+                     }];
+    }
+}
+
+- (BOOL)runOnSendBlocks:(BugsnagConfiguration *)configuration
+                  event:(BugsnagEvent *)event {
+    for (BugsnagOnSendErrorBlock onSendErrorBlock in configuration.onSendBlocks) {
+        @try {
+            if (!onSendErrorBlock(event)) {
+                return false;
+            }
+        } @catch (NSException *exception) {
+            bsg_log_err(@"Error from onSend callback: %@", exception);
+        }
+    }
+    return true;
+}
+
+/**
+ * Generates an Error Reporting API payload that can be sent to Bugsnag.
+ * @param event a single BugsnagEvent
+ * @return an Error Reporting API payload represented as a serializable dictionary
+ */
+- (NSDictionary *)prepareEventPayload:(BugsnagEvent *)event {
     NSMutableDictionary *data = [[NSMutableDictionary alloc] init];
     BSGDictSetSafeObject(data, [[Bugsnag client].notifier toDict], BSGKeyNotifier);
     BSGDictSetSafeObject(data, [Bugsnag client].configuration.apiKey, BSGKeyApiKey);
     BSGDictSetSafeObject(data, @"4.0", @"payloadVersion");
-
-    NSMutableArray *formatted =
-            [[NSMutableArray alloc] initWithCapacity:[events count]];
-
-    for (BugsnagEvent *event in events) {
-        event.redactedKeys = [Bugsnag configuration].redactedKeys;
-        BSGArrayAddSafeObject(formatted, [event toJson]);
-    }
-
-    BSGDictSetSafeObject(data, formatted, BSGKeyEvents);
+    BSGDictSetSafeObject(data, @[[event toJson]], BSGKeyEvents);
     return data;
 }
 
